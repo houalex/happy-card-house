@@ -1,9 +1,9 @@
 # Session State Machine
 
 **Project:** Poker Game  
-**Version:** 1.0  
+**Version:** 1.1  
 **Status:** Phase 1 design  
-**Suggested path:** `docs/design/state-machines/Session_State_Machine_v1.0.md`
+**Suggested path:** `docs/design/state-machines/Session_State_Machine_v1.1.md`
 
 ## 1. Purpose and Scope
 
@@ -58,7 +58,7 @@ stateDiagram-v2
 - Persist the actual `start_at` and configured duration.
 - Set the deadline to `start_at + duration`.
 - Change Session to `ACTIVE` and Room to `ACTIVE` as one consistent operation.
-- Initialize the first Hand and broadcast the new state.
+- Initialize the first Hand and broadcast the new state. The Session orchestrator owns Hand creation and subsequent scheduling; the Hand Engine owns only the individual Hand lifecycle.
 
 ### ST-03: Cancel Before Start — WAITING → CANCELLED
 
@@ -111,12 +111,14 @@ stateDiagram-v2
 - The maximum is accessed through Room configuration (`getMaxBuyIn()`), which returns 400 in Phase 1.
 - No more than nine players may be seated, and Room membership may not exceed 20 including spectators.
 - During `ACTIVE`, a new player can join and sit, but cannot enter a Hand already in progress.
-- On first entry, the player must post the mandatory big blind on their next eligible Hand; a partial all-in blind is allowed if the remaining Stack is insufficient.
+- On first entry, the player must contribute a **total of 2 chips** as the mandatory Big Blind on their next eligible Hand; a partial all-in blind is allowed if the remaining Stack is insufficient. An assigned ordinary BB counts toward this obligation; an assigned ordinary SB of 1 counts toward it, so only 1 additional chip is due (2 total).
+- Use the **Moving Button** rule when selecting the next Hand's Button: move clockwise to the next eligible seated player, with special heads-up Button/SB assignment. Do not place the Button on an empty seat.
 
 ### SP-02: Standing Up and Leaving
 
 - Players may request to stand up or leave during an `ACTIVE` Session.
-- A player involved in a Hand follows the Hand State Machine's deferred-exit rule: fold at their next action if required, then stand after the Hand.
+- A player involved in a Hand follows the Hand State Machine's deferred-exit rule: at their next required action, automatically Fold unless already all-in; stand/leave/kick takes effect only after Hand completion. An already all-in player retains showdown and pot eligibility.
+- At the Hand-completion boundary, apply deferred exits **before** processing pending Top-ups. Cancel pending Top-ups for players who have stood, left, been kicked, or remain marked for exit.
 - The participant record, Stack, and chip transaction history remain associated with the Session.
 - The Session timer does not pause.
 
@@ -131,7 +133,9 @@ stateDiagram-v2
 - A disconnected player receives the agreed **60-second reconnect grace period**; reconnection does not create a new Session participant.
 - The Session timer continues during disconnection.
 - Individual actions have a **30-second deadline**; two consecutive action timeouts cause automatic standing under the Hand rules.
-- The precise interaction among action timeout, reconnect grace, and deferred standing is defined by the Hand State Machine.
+- The 30-second action deadline and 60-second disconnect grace are independent. A missed action automatically CHECKs if legal, otherwise FOLDs; the per-Hand consecutive action-timeout counter is reset by a timely valid voluntary action.
+- When the 60-second disconnect grace expires, automatically stand the player immediately if not in an active Hand, or mark a deferred stand if in a Hand. In the latter case, automatically Fold at the next required action unless already all-in; preserve all-in pot eligibility and stand after Hand completion.
+- Reconnection after grace expiration does not restore a seat automatically.
 
 ## 7. Buy-in and Top-up
 
@@ -147,7 +151,9 @@ stateDiagram-v2
 - Only a seated Session participant may request Top-up.
 - A player may have at most one pending Top-up request.
 - A request accepted while a Hand is in progress remains pending; it does not change the current Hand's available chips, bets, or all-in calculation.
-- After Hand settlement and before another Hand begins, compute the allowed amount using the **post-Hand Stack**:
+- The Hand Engine finishes Hand settlement and marks the Hand `COMPLETED` without settling the Session. Session processing then applies deferred exits and evaluates pending Top-ups.
+- **First cancel** requests for players who stood up, left, were kicked, reached disconnect-grace expiration, or are otherwise pending exit. Do not change Stack or record a successful `TOPUP` transaction for cancelled requests.
+- For still-seated, eligible players only, compute the allowed amount using the **post-Hand Stack**:
 
   `available_top_up = max(0, getMaxBuyIn() - final_stack)`
 
@@ -165,9 +171,21 @@ stateDiagram-v2
 
 - Do not accept new requests once the deadline has passed.
 - Requests accepted before expiration are retained.
-- Settle the final Hand first; then validate each pending request against the final post-Hand Stack.
+- Complete the final Hand first. Session processing then applies deferred exits and cancels the pending Top-ups of exited/pending-exit players; only requests from still-seated eligible players are validated against the final post-Hand Stack.
 - Apply valid requests in full and cancel invalid requests in full before Session completion, even though no subsequent Hand will be played.
 - A successful final Top-up increases both the final Stack and the total amount bought in, so it does not by itself create poker profit.
+
+### SC-05: Hand Completion Handoff and Scheduling
+
+On receipt of a persisted, idempotent `HandCompleted` event, Session processing (serialized per table) must:
+
+1. Confirm the Hand is `COMPLETED` and its chip awards and `HAND_PLAYER.ending_stack` are persisted.
+2. Apply deferred stand/leave/kick and disconnect-grace-expiration exits, preserving Hand history and all-in awards.
+3. Cancel pending Top-ups for exited or pending-exit players; validate and apply remaining eligible requests in full or cancel them in full.
+4. If the Session deadline has been reached, enter or remain in `FINISHING` and perform final Session settlement; no new Hand may start.
+5. Otherwise, if Session is `ACTIVE` and at least two eligible seated players remain, atomically recheck the deadline and create the next Hand. If not, wait while the Session clock continues.
+
+Hand settlement **never** performs Session settlement or directly closes the Room. Session completion closes the Room through the Room state transition.
 
 ## 8. Final Settlement and Statistics
 

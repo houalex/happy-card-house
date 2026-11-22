@@ -1,8 +1,8 @@
 # 1. Room State Machine
 
 **Project:** Poker Game  
-**Version:** 1.0  
-**Status:** Approved  
+**Version:** 1.1  
+**Status:** Phase 1 revised design  
 **Scope:** Room lifecycle, membership, host permissions, and room-level operations.
 
 ## 1.1 Overview
@@ -105,11 +105,9 @@ Trigger:
 - The associated Session reaches its completion condition.
 
 Actions:
-- Allow any Hand already in progress to finish.
-- Complete the Hand settlement.
-- Process applicable pending operations.
-- Finalize Session balances and results.
-- Mark the Session as completed.
+- Allow any Hand already in progress to finish under the Hand State Machine.
+- Let Session processing resolve deferred exits, cancel/apply pending Top-ups, and finalize Session balances and results.
+- Close the Room only after the Session has been marked `COMPLETED`; the Room itself does not perform Hand or Session settlement.
 - Change Room status to `CLOSED`.
 - Notify connected members.
 
@@ -146,7 +144,9 @@ All operations remain subject to authentication, membership, seating, Session, a
 - Players may take available seats in `WAITING` or `ACTIVE`.
 - A player who sits down during an ongoing Hand cannot participate in that Hand.
 - The existing first-entry big-blind rule applies when the player becomes eligible for the next Hand.
-- Standing up during a Hand follows the Hand State Machine's deferred-exit rules.
+- A player seated during an ongoing Hand cannot participate until the next eligible Hand. The Hand Engine uses a **Moving Button**: the Button moves clockwise to the next eligible seated player, with heads-up Button = Small Blind. Blind placement must be recalculated when seats change; do not assign blinds to empty seats.
+- On the first eligible Hand, a newly seated player must contribute a total mandatory Big Blind of 2 chips. If assigned the ordinary Big Blind, no duplicate is collected; if assigned the ordinary Small Blind, the Small Blind contribution counts toward the total 2, so only 1 additional chip is collected (2 total). Partial all-in is allowed if the stack is insufficient. This is a forced contribution, not a second ordinary blind position.
+- Standing up, voluntarily leaving, or being kicked during a Hand follows the Hand State Machine's deferred-exit rules: automatically Fold at the next required action, then exit after Hand completion. Already all-in players retain showdown and pot eligibility.
 
 ### RM-03: Rejoining
 
@@ -182,7 +182,8 @@ Temporary disconnections are handled under the existing reconnection grace rules
 - A kicked user is prohibited from rejoining the same Room.
 - If the target is participating in an active Hand, removal must respect the Hand State Machine's fold and settlement rules.
 - Kicking must not delete historical actions, transactions, or Session participation records.
-- Pending Top-up requests belonging to a removed player must be resolved or cancelled according to the applicable Session rules.
+- Pending Top-up requests of players who are kicked, stand up, or have a pending exit at Hand completion are **cancelled**, not applied. No successful `TOPUP` transaction is recorded for a cancelled request.
+- For an active Hand, immediately revoke a kicked player's ability to submit voluntary actions, mark the deferred exit, automatically Fold at their next required action unless already all-in, and remove them from the Room only after Hand completion. Preserve all-in showdown eligibility.
 
 ## 1.7 Buy-in and Top-up
 
@@ -200,7 +201,8 @@ Temporary disconnections are handled under the existing reconnection grace rules
 - Players may request Top-up during an ongoing Hand.
 - A Top-up request does not immediately change the player's available Stack.
 - Each player may have at most one pending Top-up request.
-- Pending requests are evaluated after the current Hand is settled and before the next Hand begins.
+- Pending requests are evaluated **by Session processing after Hand reaches `COMPLETED`**, after deferred stand/leave/kick and disconnect-expiry exits have been applied, and before the next Hand begins or final Session settlement.
+- If the requester is no longer seated, was kicked, or is pending exit at that boundary, cancel the request entirely. A cancellation does not change Stack or create a successful `TOPUP` transaction.
 
 The available Top-up amount is:
 
@@ -219,6 +221,15 @@ If the amount is valid:
 Winning chips may cause a player's Stack to exceed the Buy-in maximum. The maximum restricts chips added through Buy-in and Top-up, not winnings.
 
 The frontend should prevent obviously invalid requests, but the backend must perform the authoritative validation.
+
+### RB-03: Disconnect Grace Expiration
+
+- Disconnect starts a 60-second reconnect grace period; it does not pause a running 30-second action timer or the Session clock.
+- If the player reconnects before grace expiration, restore their authoritative state and remaining action time, if any.
+- If grace expires and the player is not in an active Hand, stand them immediately.
+- If grace expires while the player is in an active Hand, mark deferred stand-up; at their next required action, automatically Fold unless already all-in. Stand after the Hand; all-in showdown and pot rights remain intact.
+- A reconnect after grace expiration does not automatically restore the seat; re-entry requires normal seating eligibility.
+- Cancel any pending Top-up when the player stands at the Hand boundary.
 
 ## 1.8 Backend Enforcement
 

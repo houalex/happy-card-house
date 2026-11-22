@@ -1,9 +1,9 @@
 # Hand State Machine
 
 **Project:** Poker Game  
-**Version:** 1.0  
+**Version:** 1.1  
 **Scope:** Phase 1 No-Limit Texas Hold'em hand lifecycle, betting, timeouts, showdown, and settlement  
-**Related documents:** `Room_State_Machine_v1.0.md`, `Session_State_Machine_v1.0.md`
+**Related documents:** `Room_State_Machine_v1.1.md`, `Session_State_Machine_v1.1.md`
 
 ## 1. Overview
 
@@ -22,7 +22,7 @@ Phase 1 uses Small Blind = 1 and Big Blind = 2. **Straddle is not supported in P
 | `RIVER` | Deal fifth community card and run betting round. |
 | `RUNOUT` | No further betting is possible; automatically deal remaining community cards. |
 | `SHOWDOWN` | Reveal eligible hands, rank hands, and determine pot winners. |
-| `SETTLEMENT` | Return uncalled chips, allocate pots, persist results, and apply deferred hand-end operations. |
+| `SETTLEMENT` | Return uncalled chips, allocate pots, and persist Hand results. Deferred exits, Top-ups, next-Hand scheduling, and Session settlement belong to Session orchestration after Hand completion. |
 | `COMPLETED` | Hand is fully settled; terminal state. |
 
 `RUNOUT` is entered only when at least two non-folded players remain and no further betting is possible. A Hand may reach `SETTLEMENT` directly when all but one player fold.
@@ -78,7 +78,7 @@ Actions:
 
 ### HT-02: First-Hand Mandatory Big Blind
 
-A player newly seated in the Session must post the mandatory Big Blind (2 chips) on their first eligible Hand. A partial all-in blind is permitted if their stack is below 2. The Hand engine must avoid collecting the same mandatory BB twice if the player is also assigned the ordinary BB position. Exact seat-entry scheduling and button movement must be consistent across Hands.
+A player newly seated in the Session must post the mandatory Big Blind (2 chips) on their first eligible Hand. A partial all-in blind is permitted if their stack is below 2. The Hand engine must avoid collecting the same mandatory BB twice if the player is also assigned the ordinary BB position. Use the **Moving Button** rule: advance the Button clockwise to the next eligible seated player, never to an empty seat; in heads-up, the Button is also the Small Blind. A newly seated player's first eligible Hand requires a **total mandatory contribution of 2 chips**. An ordinary BB already satisfies it; an ordinary SB contribution of 1 counts toward it, with only 1 extra chip due (2 total). The additional amount is a forced contribution, not a second ordinary blind. A short stack posts as much as possible (partial all-in). Seat-entry and position selection must be consistent across Hands.
 
 ## 5. Betting Rounds
 
@@ -132,7 +132,15 @@ If exactly one non-folded player remains, go to `SETTLEMENT` without showdown. I
 - Disconnect does not pause the 30-second action clock.
 - The 60-second reconnection grace period is a separate connection/participation rule.
 - Reconnecting restores the player's authoritative current Hand view and remaining action time, if any.
-- If disconnect grace expires, process the resulting leave/stand behavior without corrupting the Hand; a player with a pending turn must still receive the applicable timeout action.
+- If the 60-second grace expires, automatically stand the player if not in a Hand; if participating in a Hand, mark `pendingStand` and automatically Fold at the next required action unless already all-in. Stand after Hand completion, preserving any all-in showdown/pot eligibility.
+- The 30-second action timeout and 60-second disconnect expiration are independent; a player with a pending turn still receives the applicable timeout action. Reconnection after grace expiration does not automatically restore the seat.
+
+### HT-04A: Voluntary Stand, Leave, and Host Kick
+
+- During a Hand, stand/leave/kick sets a deferred exit; do not remove `HAND_PLAYER` mid-Hand.
+- At that player's next required action, the server automatically FOLDs the player unless already all-in. An already all-in player remains eligible for showdown and applicable pots.
+- Once Hand is `COMPLETED`, Session orchestration applies the deferred exit before Top-up validation and next-Hand scheduling.
+- A kicked player immediately loses permission to submit voluntary actions and cannot rejoin that Room. Preserve the Hand's actions and results.
 
 ## 7. All-in and Automatic Runout
 
@@ -158,29 +166,26 @@ All-in players remain eligible for only the pots supported by their contribution
 - For each pot, determine eligible winners and distribute chips; tied winners split that pot.
 - Use a deterministic rule for odd chips, documented and tested before implementation.
 
-### HT-07: Settlement
+### HT-07: Hand Settlement
 
-1. Finalize player contributions and return any uncalled amount.
-2. Build and award the main pot and side pots, or award the uncontested pot to the sole remaining player.
-3. Compute and persist each `HAND_PLAYER.ending_stack` and Hand result.
-4. Persist Hand completion and action/card history consistently; ensure settlement is idempotent.
-5. Resolve pending stand/leave/kick requests after the Hand, preserving player and Hand history.
-6. Process pending Top-ups using the **post-Hand stack**, before the next Hand or final Session settlement. A request exceeding the available cap is cancelled entirely, never partially filled.
-7. If Session time has expired, finish the Session settlement; otherwise, if at least two eligible seated players remain, automatically start the next Hand.
+1. Finalize contributions and return any uncalled amount.
+2. Build and award main and side pots, or award the uncontested pot to the sole remaining player.
+3. Compute and persist `HAND_PLAYER.ending_stack`, Hand results, action/card history, and Hand completion consistently and idempotently.
+4. Transition Hand `SETTLEMENT → COMPLETED` and notify Session orchestration with an idempotent `HandCompleted` event.
 
-**Top-up between Hands:** When no Hand is in progress, validate and apply a valid Top-up immediately before the next Hand begins.
+**Boundary:** Hand settlement must **not** process Top-ups, change Room membership/seating, schedule the next Hand, finalize Session results, or close the Room. Session orchestration owns these steps after Hand completion. The `HandCompleted` event must not be processed twice.
 
-**Top-up at Session expiry:** Requests accepted before expiry remain pending through the final Hand; after that Hand settles, process valid requests before final Session settlement, even though no next Hand will occur.
+**Session-side post-Hand order (reference only):** apply deferred stand/leave/kick/disconnect-expiry exits; cancel pending Top-ups for players who exited or are pending exit; validate/apply eligible remaining Top-ups against post-Hand Stack; check Session deadline; either finalize the Session or schedule the next eligible Hand. Requests accepted before Session expiration remain eligible for this validation only if the requester is still seated and eligible.
 
 ## 9. Automatic Next Hand
 
-A completed Hand triggers the next Hand automatically only if:
+Session orchestration may start the next Hand after receiving `HandCompleted` only if:
 - The Session is still `ACTIVE` and its deadline has not been reached.
 - At least two eligible players are seated.
-- Previous Hand settlement, Top-ups, and deferred seat changes are complete.
+- Previous Hand settlement is persisted; deferred exits and pending Top-up cancellations/applications are complete.
 - No other Hand is active.
 
-If fewer than two eligible players remain, the Session stays `ACTIVE` and its timer continues. A later arrival may allow gameplay to resume before the deadline. The Host does not need to start each Hand manually.
+If fewer than two eligible players remain, the Session stays `ACTIVE` and its timer continues. A later arrival may allow gameplay to resume before the deadline. The Host does not need to start each Hand manually. **This scheduling is Session-owned; the Hand Engine does not perform it.**
 
 ## 10. Phase 1 Straddle Policy and Phase 2 Extension
 
@@ -210,8 +215,11 @@ If fewer than two eligible players remain, the Session stays `ACTIVE` and its ti
 9. A second consecutive timeout triggers stand-up after the Hand, not during it.
 10. No Straddle/Re-straddle is allowed in Phase 1.
 11. No new Hand begins after Session expiry.
-12. Final-Hand pending Top-ups are resolved before Session completion.
+12. Session processing resolves final-Hand pending Top-ups before Session completion, cancelling requests from players who exited or are pending exit.
+13. Hand `SETTLEMENT` does not perform Session settlement or Room closure.
+14. The Button follows the Moving Button rule; a newly seated SB contributes a total of 2 chips toward the first-entry mandatory BB.
+15. Disconnect-grace expiration causes automatic stand-up, deferred until Hand completion for a player in an active Hand; all-in eligibility is preserved.
 
 ## 13. Open Implementation Details (not additional Phase 1 feature commitments)
 
-The following should be specified in rule tests before coding: exact button movement when seats become empty, how the first-entry mandatory BB interacts with a player who joins mid-rotation, deterministic odd-chip allocation, short all-in reopening examples, and the precise recovery behavior for an interrupted settlement. These are implementation details to make the confirmed game rules unambiguous, not a request to expand Phase 1 scope.
+The following should be specified in rule tests before coding: edge-case tests for Moving Button when seats become empty and first-entry mandatory BB on a player joining mid-rotation, deterministic odd-chip allocation, short all-in reopening examples, and the precise recovery behavior for an interrupted settlement. These are implementation details to make the confirmed game rules unambiguous, not a request to expand Phase 1 scope.
